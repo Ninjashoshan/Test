@@ -1,4 +1,4 @@
-// TwLog 0.1.0
+// TwLog 0.2.0
 // Logs the Twitter app's (com.atebits.Tweetie2) network and web view activity
 // to the system log with the prefix "[TwLog]".
 //
@@ -415,6 +415,73 @@ static void hookNavDelegateClass(Class c) {
 
 %end
 
+#pragma mark - All NSURLSession tasks (start + finish), however they were created
+
+static char kStartKey, kDoneKey;
+
+static void hookTaskClass(Class c) {
+    {
+        SEL sel = @selector(resume);
+        if (canHook(c, sel)) {
+            __block IMP orig = NULL;
+            IMP rep = imp_implementationWithBlock(^(id _self) {
+                if ([_self isKindOfClass:[NSURLSessionTask class]] && !objc_getAssociatedObject(_self, &kStartKey)) {
+                    objc_setAssociatedObject(_self, &kStartKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    NSURLSessionTask *t = _self;
+                    NSURLRequest *r = t.currentRequest ?: t.originalRequest;
+                    TLOG(@"[task-start] %@ %@ %@ bodyBytes=%lu stream=%d ctype=%@ ua=%@ clientver=%@",
+                         NSStringFromClass([_self class]), r.HTTPMethod ?: @"?", safeURL(r.URL),
+                         (unsigned long)r.HTTPBody.length, (int)(r.HTTPBodyStream != nil),
+                         headerOf(r, @"Content-Type", 40), headerOf(r, @"User-Agent", 60),
+                         headerOf(r, @"X-Twitter-Client-Version", 20));
+                }
+                if (orig) ((void (*)(id, SEL))orig)(_self, sel);
+            });
+            MSHookMessageEx(c, sel, rep, &orig);
+            noteRep(rep);
+        }
+    }
+    {
+        SEL sel = NSSelectorFromString(@"setState:");
+        if (canHook(c, sel)) {
+            __block IMP orig = NULL;
+            IMP rep = imp_implementationWithBlock(^(id _self, NSInteger s) {
+                if (orig) ((void (*)(id, SEL, NSInteger))orig)(_self, sel, s);
+                if ((int)s == 3 && [_self isKindOfClass:[NSURLSessionTask class]] && !objc_getAssociatedObject(_self, &kDoneKey)) {
+                    objc_setAssociatedObject(_self, &kDoneKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    NSURLSessionTask *t = _self;
+                    NSURLRequest *r = t.currentRequest ?: t.originalRequest;
+                    TLOG(@"[task-done] %@ status=%ld err=%@ url=%@", r.HTTPMethod ?: @"?", statusOf(t.response), errStr(t.error), safeURL(r.URL));
+                }
+            });
+            MSHookMessageEx(c, sel, rep, &orig);
+            noteRep(rep);
+        }
+    }
+}
+
+static void hookTaskClasses(void) {
+    NSURLSession *ses = [NSURLSession sharedSession];
+    NSURL *u = [NSURL URLWithString:@"http://127.0.0.1/"];
+    NSURLRequest *rq = [NSURLRequest requestWithURL:u];
+    NSMutableArray *samples = [NSMutableArray array];
+    id t;
+    if ((t = [ses dataTaskWithRequest:rq])) [samples addObject:t];
+    if ((t = [ses uploadTaskWithRequest:rq fromData:[NSData data]])) [samples addObject:t];
+    if ((t = [ses downloadTaskWithRequest:rq])) [samples addObject:t];
+    NSMutableArray *chain = [NSMutableArray array];
+    for (id sample in samples) {
+        for (Class c = object_getClass(sample); c && c != [NSObject class]; c = class_getSuperclass(c)) {
+            if (![chain containsObject:c]) [chain addObject:c];
+        }
+    }
+    // Base classes first, so a subclass that calls super does not double-log (the associated-object flags also guard this).
+    for (Class c in [chain reverseObjectEnumerator]) {
+        TLOG(@"[hook] task class %s", class_getName(c));
+        hookTaskClass(c);
+    }
+}
+
 #pragma mark - Init
 
 %ctor {
@@ -427,6 +494,7 @@ static void hookNavDelegateClass(Class c) {
         hookSessionClass([NSURLSession class]);
         if (shared && shared != [NSURLSession class]) hookSessionClass(shared);
         hookSessionFactory();
+        hookTaskClasses();
 
         %init;
     }
