@@ -1,4 +1,4 @@
-// TwLog 0.4.0
+// TwLog 0.5.0
 // Logs the Twitter app's (com.atebits.Tweetie2) network and web view activity
 // to the system log with the prefix "[TwLog]".
 //
@@ -638,6 +638,121 @@ static void hookTNL(void) {
 
 %end
 
+#pragma mark - Auth / TNL tracing (log-only hooks that forward every argument unchanged)
+
+typedef void (^TLEntryLogger)(id self, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f);
+
+static id objAt(uintptr_t v) { return v ? (__bridge id)(void *)v : nil; }
+
+static NSString *urlOfRequest(id req) {
+    if (!req) return @"(nil)";
+    @try {
+        id url = [req valueForKey:@"URL"];
+        if ([url isKindOfClass:[NSURL class]]) return safeURL(url);
+    } @catch (NSException *ex) {}
+    return [NSString stringWithFormat:@"(%@)", NSStringFromClass([req class])];
+}
+
+static NSString *lenOf(id o) {
+    if (!o) return @"nil";
+    if ([o respondsToSelector:@selector(length)]) return [NSString stringWithFormat:@"%@ len=%lu", NSStringFromClass([o class]), (unsigned long)[(NSString *)o length]];
+    return NSStringFromClass([o class]);
+}
+
+// Hooks a method (instance method of c; pass the metaclass for class methods) and calls `logger` before forwarding.
+static void hookEntry(Class c, NSString *selName, TLEntryLogger logger) {
+    SEL sel = NSSelectorFromString(selName);
+    if (!canHook(c, sel)) { TLOG(@"[hook] missing %s %@", c ? class_getName(c) : "(nil class)", selName); return; }
+    __block IMP orig = NULL;
+    IMP rep = imp_implementationWithBlock(^uintptr_t(id _self, uintptr_t a, uintptr_t b, uintptr_t cc, uintptr_t d, uintptr_t e, uintptr_t f) {
+        @try { logger(_self, a, b, cc, d, e, f); } @catch (NSException *ex) {}
+        if (!orig) return 0;
+        return ((uintptr_t (*)(id, SEL, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))orig)(_self, sel, a, b, cc, d, e, f);
+    });
+    MSHookMessageEx(c, sel, rep, &orig);
+    noteRep(rep);
+}
+
+static void hookAuthAndTNL(void) {
+    Class gm = NSClassFromString(@"TFSAuthGuestAuthManager");
+    hookEntry(gm, @"signRequest:completion:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[auth] guest signRequest %@", urlOfRequest(objAt(a)));
+    });
+    hookEntry(gm, @"retrieveGuestAuthTokensWithCompletionBlock:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[auth] retrieveGuestAuthTokens");
+    });
+    hookEntry(gm, @"_acquireGuestToken", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[auth] _acquireGuestToken");
+    });
+    hookEntry(gm, @"_acquireTokensWithAppToken:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[auth] _acquireTokensWithAppToken appToken=%@", lenOf(objAt(a)));
+    });
+    hookEntry(gm, @"_acquireTokensUseKeychain:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[auth] _acquireTokensUseKeychain use=%d", (int)(a & 0xFF));
+    });
+    hookEntry(gm, @"_tokenAcquisitionDidCompleteWithSuccess:error:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        id err = objAt(b);
+        TLOG(@"[auth] _tokenAcquisitionDidComplete success=%d err=%@", (int)(a & 0xFF), [err isKindOfClass:[NSError class]] ? errStr(err) : @"none");
+    });
+    hookEntry(gm, @"_handleTokenAcquisitionServerCallFailure:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        id o = objAt(a);
+        TLOG(@"[auth] _handleTokenAcquisitionServerCallFailure arg=%@ %@", o ? NSStringFromClass([o class]) : @"nil", [o isKindOfClass:[NSError class]] ? errStr(o) : @"");
+    });
+    hookEntry(gm, @"setAuthState:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[auth] guest authState -> %ld", (long)a);
+    });
+    hookEntry(gm, @"setGuestToken:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[auth] setGuestToken %@", lenOf(objAt(a)));
+    });
+    hookEntry(gm, @"_isInvalidAppTokenFromHTTPStatus:apiErrorCode:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[auth] _isInvalidAppToken httpStatus=%ld apiErrorCode=%ld", (long)a, (long)b);
+    });
+    hookEntry(gm, @"handleGuestAuthRequestResponse:completion:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        id o = objAt(a);
+        TLOG(@"[auth] handleGuestAuthRequestResponse %@", o ? NSStringFromClass([o class]) : @"nil");
+    });
+
+    // Sign-in manager (identifiers and passwords are never logged).
+    Class sm = NSClassFromString(@"T1SignInManager");
+    hookEntry(sm, @"addUser:password:oneFactorAuthorizationRequestType:uiMetrics:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[signin] addUser called type=%ld uiMetrics=%@", (long)c, lenOf(objAt(d)));
+    });
+    hookEntry(sm, @"_requestAccessTokensWithIdentifier:password:uiMetrics:oneFactorAuthorizationRequestType:responseBlock:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[signin] _requestAccessTokens uiMetrics=%@ type=%ld", lenOf(objAt(c)), (long)d);
+    });
+    if (sm) {
+        hookEntry(object_getClass(sm), @"_guestAuthCreateAuthenticatedRequestWithIdentifier:password:simCountryCode:uiMetrics:oneFactorAuthorizationRequestType:responseBlock:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+            TLOG(@"[signin] _guestAuthCreateAuthenticatedRequest uiMetrics=%@ type=%ld", lenOf(objAt(d)), (long)e);
+        });
+    }
+    hookEntry(sm, @"_mappedErrorFromAPIResponseModelParseError:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        id err = objAt(a);
+        TLOG(@"[signin] _mappedErrorFromAPIResponseModelParseError %@", [err isKindOfClass:[NSError class]] ? errStr(err) : @"nil");
+    });
+
+    // TNL operation lifecycle.
+    Class op = NSClassFromString(@"TNLRequestOperation");
+    hookEntry(op, @"_tnl_setState:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[tnl-state] -> %ld %@", (long)a, describeTNLOp(s));
+    });
+    hookEntry(op, @"setHydratedRequest:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        TLOG(@"[tnl-hydrated] %@", describeTNLOp(s));
+    });
+    hookEntry(op, @"cancelWithSource:underlyingError:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        id src = objAt(a); id err = objAt(b);
+        NSString *sd = src ? [NSString stringWithFormat:@"%@", src] : @"nil";
+        if (sd.length > 80) sd = [sd substringToIndex:80];
+        TLOG(@"[tnl-cancel] source=%@ underlying=%@ %@", sd, [err isKindOfClass:[NSError class]] ? errStr(err) : @"none", describeTNLOp(s));
+    });
+    Class q = NSClassFromString(@"TNLRequestOperationQueue");
+    hookEntry(q, @"operation:didCompleteWithResponse:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f) {
+        id o = objAt(a);
+        id err = nil;
+        @try { err = [o valueForKey:@"error"]; } @catch (NSException *ex) {}
+        TLOG(@"[tnl-complete] error=%@ %@", [err isKindOfClass:[NSError class]] ? errStr(err) : @"none", describeTNLOp(o));
+    });
+}
+
 #pragma mark - Init
 
 %ctor {
@@ -652,11 +767,11 @@ static void hookTNL(void) {
         hookSessionFactory();
         hookTaskClasses();
         hookTNL();
+        hookAuthAndTNL();
 
         %init;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ dumpInterestingClasses(); });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            for (NSString *cn in @[@"TNLRequestOperation", @"TNLRequestOperationQueue", @"T1SignInManager", @"T1AdaptiveSignInFlow", @"TFSAuthGuestAuthManager", @"T1OnboardingFlowController"]) dumpSelectors(cn);
+            for (NSString *cn in @[@"TFSAPIRequestOperation", @"TFSAuthCredentialsManager", @"TFSAuthBearerRequestAuthorizer", @"TFSAuthOAuth1RequestAuthorizer"]) dumpSelectors(cn);
         });
     }
 }
