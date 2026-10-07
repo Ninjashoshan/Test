@@ -1,4 +1,4 @@
-// TwLog 0.2.0
+// TwLog 0.3.0
 // Logs the Twitter app's (com.atebits.Tweetie2) network and web view activity
 // to the system log with the prefix "[TwLog]".
 //
@@ -482,6 +482,105 @@ static void hookTaskClasses(void) {
     }
 }
 
+#pragma mark - App-level breadcrumbs (errors, screens, alerts, notifications, class names)
+
+static BOOL interestingDomain(NSString *d) {
+    if (!d.length) return NO;
+    for (NSString *p in @[@"NS", @"kCF", @"com.apple", @"WK", @"_NS", @"AV", @"CK", @"SK"]) {
+        if ([d hasPrefix:p]) return NO;
+    }
+    return YES;
+}
+
+static BOOL interestingNotification(NSString *n) {
+    if (!n.length) return NO;
+    for (NSString *p in @[@"UI", @"NS", @"_", @"AV", @"CA", @"WK", @"CF", @"com.apple", @"AX"]) {
+        if ([n hasPrefix:p]) return NO;
+    }
+    NSString *lo = n.lowercaseString;
+    for (NSString *k in @[@"auth", @"login", @"onboard", @"account", @"guest", @"signin", @"session", @"token", @"metric", @"instrument", @"flow", @"user"]) {
+        if ([lo containsString:k]) return YES;
+    }
+    return NO;
+}
+
+static void dumpInterestingClasses(void) {
+    NSArray *keys = @[@"auth", @"login", @"onboard", @"guest", @"signin", @"instrument", @"metric", @"xauth", @"account"];
+    unsigned int ic = 0;
+    const char **imgs = objc_copyImageNames(&ic);
+    int shown = 0;
+    unsigned int scanned = 0;
+    for (unsigned int i = 0; i < ic; i++) {
+        if (!strstr(imgs[i], ".app/")) continue;
+        unsigned int n = 0;
+        const char **names = objc_copyClassNamesForImage(imgs[i], &n);
+        scanned += n;
+        for (unsigned int j = 0; j < n && shown < 300; j++) {
+            NSString *nm = [NSString stringWithUTF8String:names[j]];
+            NSString *lo = nm.lowercaseString;
+            for (NSString *k in keys) {
+                if ([lo containsString:k]) { TLOG(@"[class] %@", nm); shown++; break; }
+            }
+        }
+        free(names);
+    }
+    free(imgs);
+    TLOG(@"[classes] scanned %u app classes, listed %d", scanned, shown);
+}
+
+%hook NSError
+
+- (instancetype)initWithDomain:(NSString *)domain code:(NSInteger)code userInfo:(NSDictionary *)dict {
+    if (interestingDomain(domain)) {
+        NSString *desc = dict[NSLocalizedDescriptionKey];
+        if (![desc isKindOfClass:[NSString class]]) desc = @"-";
+        if (desc.length > 120) desc = [desc substringToIndex:120];
+        TLOG(@"[error-created] domain=%@ code=%ld desc=%@ keys=%@", domain, (long)code, desc,
+             [[dict allKeys] componentsJoinedByString:@","]);
+    }
+    return %orig;
+}
+
+%end
+
+%hook UIViewController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    NSString *cn = NSStringFromClass([self class]);
+    if ([self isKindOfClass:[UIAlertController class]]) {
+        UIAlertController *a = (UIAlertController *)self;
+        TLOG(@"[alert] title=%@ message=%@", a.title, a.message);
+    } else if (![cn hasPrefix:@"UI"] && ![cn hasPrefix:@"_UI"]) {
+        TLOG(@"[vc] appeared %@ title=%@", cn, self.title);
+    }
+}
+
+%end
+
+%hook UIAlertView
+
+- (void)show {
+    TLOG(@"[alert] (UIAlertView) title=%@ message=%@", [self valueForKey:@"title"], [self valueForKey:@"message"]);
+    %orig;
+}
+
+%end
+
+%hook NSNotificationCenter
+
+- (void)postNotificationName:(NSString *)name object:(id)obj userInfo:(NSDictionary *)info {
+    if (interestingNotification(name)) TLOG(@"[notify] %@ from %@", name, NSStringFromClass([obj class]));
+    %orig;
+}
+
+- (void)postNotification:(NSNotification *)n {
+    if (interestingNotification(n.name)) TLOG(@"[notify] %@ from %@", n.name, NSStringFromClass([n.object class]));
+    %orig;
+}
+
+%end
+
 #pragma mark - Init
 
 %ctor {
@@ -497,5 +596,6 @@ static void hookTaskClasses(void) {
         hookTaskClasses();
 
         %init;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ dumpInterestingClasses(); });
     }
 }
