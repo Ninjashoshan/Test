@@ -1,0 +1,38 @@
+name: Build TwLog
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install ldid dpkg
+
+      - name: Install Theos
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Get an iOS SDK
+        run: |
+          git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
+          ls /tmp/sdks
+          SDK=$(ls -d /tmp/sdks/iPhoneOS*.sdk | sort -V | tail -1)
+          echo "Using $SDK"
+          mkdir -p "$HOME/theos/sdks"
+          cp -R "$SDK" "$HOME/theos/sdks/"
+
+      - name: Build
+        run: make package FINALPACKAGE=1
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: TwLog-deb
+          path: packages/*.deb
