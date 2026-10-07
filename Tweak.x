@@ -1,4 +1,4 @@
-// TwLog 0.5.1
+// TwLog 0.6.0
 // 0.5.1 fix: never add a completion handler to a task that did not have one. NSURLSession routes
 // handler-less tasks through the same methods with a nil handler; wrapping nil made the app's own
 // network layer lose its delegate callbacks (requests hung until they timed out).
@@ -33,7 +33,11 @@ static NSString *safeURL(NSURL *u) {
     NSURLComponents *c = [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO];
     if (!c) return @"(unparsable)";
     NSMutableArray *names = [NSMutableArray array];
-    for (NSURLQueryItem *q in c.queryItems) [names addObject:q.name ?: @"?"];
+    for (NSURLQueryItem *q in c.queryItems) {
+        NSString *n = q.name ?: @"?";
+        if ([n isEqualToString:@"flow_name"] && q.value.length && q.value.length < 60) n = [NSString stringWithFormat:@"flow_name=%@", q.value];
+        [names addObject:n];
+    }
     NSString *base = [NSString stringWithFormat:@"%@://%@%@", c.scheme ?: @"?", c.host ?: @"", c.path ?: @""];
     if (names.count) return [base stringByAppendingFormat:@" ?[%@]", [names componentsJoinedByString:@","]];
     return base;
@@ -762,6 +766,136 @@ static void hookAuthAndTNL(void) {
     });
 }
 
+#pragma mark - Feature-switch discovery
+
+static BOOL fsKeyInteresting(NSString *k) {
+    NSString *lo = k.lowercaseString;
+    for (NSString *w in @[@"sign", @"login", @"log_in", @"onboard", @"flow", @"adaptive", @"xauth", @"welcome", @"signup", @"auth", @"wizard", @"password"]) {
+        if ([lo containsString:w]) return YES;
+    }
+    return NO;
+}
+
+static BOOL simpleEncoding(const char *t) {
+    if (!t) return NO;
+    switch (t[0]) {
+        case '@': case 'B': case 'c': case 'C': case 'i': case 'I': case 's': case 'S':
+        case 'l': case 'L': case 'q': case 'Q': case 'v': case '#': case ':': return YES;
+        default: return NO;
+    }
+}
+
+// Logs calls to a feature-switch style method (only when a string argument looks login related) and forwards unchanged.
+static BOOL hookFeatureMethod(Class c, Method m) {
+    SEL sel = method_getName(m);
+    NSString *name = NSStringFromSelector(sel);
+    if ([name hasPrefix:@"init"] || [name isEqualToString:@"dealloc"] || [name hasPrefix:@"."]) return NO;
+    unsigned int nargs = method_getNumberOfArguments(m);
+    if (nargs < 3 || nargs > 5) return NO;
+    char *rt = method_copyReturnType(m);
+    char retc = rt ? rt[0] : 0;
+    BOOL okRet = rt && simpleEncoding(rt) && retc != '#' && retc != ':';
+    if (rt) free(rt);
+    if (!okRet) return NO;
+    NSMutableString *enc = [NSMutableString string];
+    for (unsigned int i = 2; i < nargs; i++) {
+        char *at = method_copyArgumentType(m, i);
+        BOOL ok = simpleEncoding(at);
+        [enc appendFormat:@"%c", at ? at[0] : '?'];
+        if (at) free(at);
+        if (!ok) return NO;
+    }
+    if ([enc rangeOfString:@"@"].location == NSNotFound) return NO;
+    if (!canHook(c, sel)) return NO;
+    NSString *tag = [NSString stringWithUTF8String:class_getName(c)];
+    __block IMP orig = NULL;
+    IMP rep = imp_implementationWithBlock(^uintptr_t(id _self, uintptr_t a, uintptr_t b, uintptr_t cc, uintptr_t d, uintptr_t e, uintptr_t f) {
+        uintptr_t r = orig ? ((uintptr_t (*)(id, SEL, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))orig)(_self, sel, a, b, cc, d, e, f) : 0;
+        @try {
+            uintptr_t args[3] = {a, b, cc};
+            NSMutableArray *strs = [NSMutableArray array];
+            BOOL interesting = NO;
+            for (NSUInteger i = 0; i < enc.length && i < 3; i++) {
+                if ([enc characterAtIndex:i] == '@' && args[i]) {
+                    id o = objAt(args[i]);
+                    if ([o isKindOfClass:[NSString class]] && [(NSString *)o length] < 100) {
+                        [strs addObject:o];
+                        if (fsKeyInteresting(o)) interesting = YES;
+                    }
+                }
+            }
+            if (interesting) {
+                NSString *res;
+                if (retc == 'B' || retc == 'c' || retc == 'C') res = [NSString stringWithFormat:@"%d", (int)(r & 0xFF)];
+                else if (retc == 'v') res = @"void";
+                else if (retc == '@') {
+                    id ro = objAt(r);
+                    if ([ro isKindOfClass:[NSString class]] || [ro isKindOfClass:[NSNumber class]]) res = [NSString stringWithFormat:@"%@", ro];
+                    else res = ro ? NSStringFromClass([ro class]) : @"nil";
+                    if (res.length > 60) res = [res substringToIndex:60];
+                } else res = [NSString stringWithFormat:@"%ld", (long)r];
+                TLOG(@"[fs] -[%@ %@] (%@) -> %@", tag, name, [strs componentsJoinedByString:@" | "], res);
+            }
+        } @catch (NSException *ex) {}
+        return r;
+    });
+    MSHookMessageEx(c, sel, rep, &orig);
+    noteRep(rep);
+    return YES;
+}
+
+static void hookFeatureSwitchClasses(void) {
+    unsigned int ic = 0;
+    const char **imgs = objc_copyImageNames(&ic);
+    NSMutableArray *found = [NSMutableArray array];
+    for (unsigned int i = 0; i < ic; i++) {
+        if (!strstr(imgs[i], ".app/")) continue;
+        unsigned int n = 0;
+        const char **names = objc_copyClassNamesForImage(imgs[i], &n);
+        for (unsigned int j = 0; j < n; j++) {
+            NSString *nm = [NSString stringWithUTF8String:names[j]];
+            if ([nm.lowercaseString containsString:@"featureswitch"]) [found addObject:nm];
+        }
+        free(names);
+    }
+    free(imgs);
+    int hooked = 0;
+    for (NSString *nm in found) {
+        Class c = NSClassFromString(nm);
+        if (!c) continue;
+        int perClass = 0;
+        for (int pass = 0; pass < 2 && hooked < 400; pass++) {
+            Class k = pass ? object_getClass(c) : c;
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(k, &mc);
+            for (unsigned int i = 0; i < mc && hooked < 400; i++) {
+                if (hookFeatureMethod(k, ms[i])) { hooked++; perClass++; }
+            }
+            free(ms);
+        }
+        TLOG(@"[fs-class] %@ hooked=%d", nm, perClass);
+    }
+    TLOG(@"[fs] feature-switch classes found=%lu, methods hooked=%d", (unsigned long)found.count, hooked);
+}
+
+static void dumpSelectorsFiltered(NSString *className, NSArray *keys, int cap) {
+    Class c = NSClassFromString(className);
+    if (!c) { TLOG(@"[selectors] %@ : class not found", className); return; }
+    int shown = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        Class k = pass ? object_getClass(c) : c;
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(k, &n);
+        for (unsigned int i = 0; i < n && shown < cap; i++) {
+            NSString *sel = NSStringFromSelector(method_getName(ms[i]));
+            BOOL match = (keys == nil);
+            for (NSString *key in keys) { if ([sel.lowercaseString containsString:key]) { match = YES; break; } }
+            if (match) { TLOG(@"[selector] %c[%@ %@]", pass ? '+' : '-', className, sel); shown++; }
+        }
+        free(ms);
+    }
+}
+
 #pragma mark - Init
 
 %ctor {
@@ -777,10 +911,18 @@ static void hookAuthAndTNL(void) {
         hookTaskClasses();
         hookTNL();
         hookAuthAndTNL();
+        hookFeatureSwitchClasses();
 
         %init;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            for (NSString *cn in @[@"TFSAPIRequestOperation", @"TFSAuthCredentialsManager", @"TFSAuthBearerRequestAuthorizer", @"TFSAuthOAuth1RequestAuthorizer"]) dumpSelectors(cn);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            NSArray *loginKeys = @[@"log", @"sign", @"flow", @"onboard", @"welcome", @"adaptive", @"present", @"submit", @"auth"];
+            dumpSelectorsFiltered(@"T1CombinedSignUpWelcomeViewController", loginKeys, 80);
+            dumpSelectorsFiltered(@"T1HostViewController", loginKeys, 80);
+            dumpSelectorsFiltered(@"T1SignInViewController", loginKeys, 60);
+            dumpSelectorsFiltered(@"T1AdaptiveSignInFlow", nil, 60);
+            dumpSelectorsFiltered(@"T1OnboardingPresenter", nil, 60);
+            dumpSelectorsFiltered(@"TFSTwitterOnboardingFlowSpec", nil, 60);
+            dumpSelectorsFiltered(@"T1OnboardingFlowController", nil, 90);
         });
     }
 }
