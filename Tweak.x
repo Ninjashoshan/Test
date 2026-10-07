@@ -1,4 +1,4 @@
-// TwLog 0.3.0
+// TwLog 0.4.0
 // Logs the Twitter app's (com.atebits.Tweetie2) network and web view activity
 // to the system log with the prefix "[TwLog]".
 //
@@ -528,6 +528,55 @@ static void dumpInterestingClasses(void) {
     TLOG(@"[classes] scanned %u app classes, listed %d", scanned, shown);
 }
 
+static void dumpSelectors(NSString *className) {
+    Class c = NSClassFromString(className);
+    if (!c) { TLOG(@"[selectors] %@ : class not found", className); return; }
+    NSArray *keys = @[@"enqueue", @"start", @"cancel", @"fail", @"error", @"complet", @"valid", @"auth", @"login", @"sign", @"submit", @"token", @"begin", @"finish", @"state", @"request"];
+    int shown = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        Class k = pass ? object_getClass(c) : c;
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(k, &n);
+        for (unsigned int i = 0; i < n && shown < 70; i++) {
+            NSString *sel = NSStringFromSelector(method_getName(ms[i]));
+            NSString *lo = sel.lowercaseString;
+            for (NSString *key in keys) {
+                if ([lo containsString:key]) { TLOG(@"[selector] %c[%@ %@]", pass ? '+' : '-', className, sel); shown++; break; }
+            }
+        }
+        free(ms);
+    }
+}
+
+static NSString *describeTNLOp(id op) {
+    NSMutableArray *parts = [NSMutableArray array];
+    @try {
+        id req = [op valueForKey:@"originalRequest"];
+        id url = [req valueForKey:@"URL"];
+        if ([url isKindOfClass:[NSURL class]]) [parts addObject:[NSString stringWithFormat:@"url=%@", safeURL(url)]];
+        else if (req) [parts addObject:[NSString stringWithFormat:@"request=%@", NSStringFromClass([req class])]];
+    } @catch (NSException *e) { [parts addObject:@"(no originalRequest)"]; }
+    @try {
+        id st = [op valueForKey:@"state"];
+        if (st) [parts addObject:[NSString stringWithFormat:@"state=%@", st]];
+    } @catch (NSException *e) {}
+    return [parts componentsJoinedByString:@" "];
+}
+
+static void hookTNL(void) {
+    Class q = NSClassFromString(@"TNLRequestOperationQueue");
+    SEL sel = NSSelectorFromString(@"enqueueRequestOperation:");
+    if (!canHook(q, sel)) { TLOG(@"[hook] TNL enqueueRequestOperation: not found"); return; }
+    __block IMP orig = NULL;
+    IMP rep = imp_implementationWithBlock(^(id _self, id op) {
+        TLOG(@"[tnl-enqueue] %@ %@", NSStringFromClass([op class]), describeTNLOp(op));
+        if (orig) ((void (*)(id, SEL, id))orig)(_self, sel, op);
+    });
+    MSHookMessageEx(q, sel, rep, &orig);
+    noteRep(rep);
+    TLOG(@"[hook] TNL enqueueRequestOperation: hooked");
+}
+
 %hook NSError
 
 - (instancetype)initWithDomain:(NSString *)domain code:(NSInteger)code userInfo:(NSDictionary *)dict {
@@ -535,8 +584,16 @@ static void dumpInterestingClasses(void) {
         NSString *desc = dict[NSLocalizedDescriptionKey];
         if (![desc isKindOfClass:[NSString class]]) desc = @"-";
         if (desc.length > 120) desc = [desc substringToIndex:120];
-        TLOG(@"[error-created] domain=%@ code=%ld desc=%@ keys=%@", domain, (long)code, desc,
-             [[dict allKeys] componentsJoinedByString:@","]);
+        NSMutableArray *extra = [NSMutableArray array];
+        for (id k in dict) {
+            id v = dict[k];
+            if ([k isKindOfClass:[NSString class]] && [v isKindOfClass:[NSString class]] && ![k isEqualToString:NSLocalizedDescriptionKey]
+                && [(NSString *)v length] < 100 && extra.count < 5) {
+                [extra addObject:[NSString stringWithFormat:@"%@=%@", k, v]];
+            }
+        }
+        TLOG(@"[error-created] domain=%@ code=%ld desc=%@ keys=%@ values=[%@]", domain, (long)code, desc,
+             [[dict allKeys] componentsJoinedByString:@","], [extra componentsJoinedByString:@"; "]);
     }
     return %orig;
 }
@@ -594,8 +651,12 @@ static void dumpInterestingClasses(void) {
         if (shared && shared != [NSURLSession class]) hookSessionClass(shared);
         hookSessionFactory();
         hookTaskClasses();
+        hookTNL();
 
         %init;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ dumpInterestingClasses(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            for (NSString *cn in @[@"TNLRequestOperation", @"TNLRequestOperationQueue", @"T1SignInManager", @"T1AdaptiveSignInFlow", @"TFSAuthGuestAuthManager", @"T1OnboardingFlowController"]) dumpSelectors(cn);
+        });
     }
 }
