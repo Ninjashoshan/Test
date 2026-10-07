@@ -43,7 +43,7 @@ static long statusOf(NSURLResponse *r) {
 static NSString *errStr(NSError *e) {
     if (!e) return @"none";
     NSString *s = [NSString stringWithFormat:@"%@ %ld", e.domain, (long)e.code];
-    NSString *f = e.userInfo[NSURLErrorFailingURLStringKey];
+    NSString *f = e.userInfo[@"NSErrorFailingURLStringKey"];
     if ([f isKindOfClass:[NSString class]]) s = [s stringByAppendingFormat:@" failingURL=%@", safeURL([NSURL URLWithString:f])];
     return s;
 }
