@@ -13,6 +13,12 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 
+// Theos builds with -Werror; keep harmless "unused" warnings from failing the build.
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+
 #define TLOG(fmt, ...) NSLog(@"[TwLog] " fmt, ##__VA_ARGS__)
 
 typedef void (^TLCompletion)(NSData *, NSURLResponse *, NSError *);
