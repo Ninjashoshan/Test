@@ -1,4 +1,7 @@
-// TwLog 0.5.0
+// TwLog 0.5.1
+// 0.5.1 fix: never add a completion handler to a task that did not have one. NSURLSession routes
+// handler-less tasks through the same methods with a nil handler; wrapping nil made the app's own
+// network layer lose its delegate callbacks (requests hung until they timed out).
 // Logs the Twitter app's (com.atebits.Tweetie2) network and web view activity
 // to the system log with the prefix "[TwLog]".
 //
@@ -107,7 +110,7 @@ static void hookSessionClass(Class c) {
                 if (!orig) return nil;
                 TLOG(@"[req] dataTask %@ %@ ua=%@ clientver=%@", req.HTTPMethod, safeURL(req.URL),
                      headerOf(req, @"User-Agent", 60), headerOf(req, @"X-Twitter-Client-Version", 20));
-                return ((id (*)(id, SEL, id, id))orig)(_self, sel, req, wrapCompletion(@"dataTask", req, h));
+                return ((id (*)(id, SEL, id, id))orig)(_self, sel, req, (h ? wrapCompletion(@"dataTask", req, h) : nil));
             });
             MSHookMessageEx(c, sel, rep, &orig);
             noteRep(rep);
@@ -121,7 +124,7 @@ static void hookSessionClass(Class c) {
                 if (!orig) return nil;
                 NSURLRequest *req = url ? [NSURLRequest requestWithURL:url] : nil;
                 TLOG(@"[req] dataTask(url) GET %@", safeURL(url));
-                return ((id (*)(id, SEL, id, id))orig)(_self, sel, url, wrapCompletion(@"dataTask(url)", req, h));
+                return ((id (*)(id, SEL, id, id))orig)(_self, sel, url, (h ? wrapCompletion(@"dataTask(url)", req, h) : nil));
             });
             MSHookMessageEx(c, sel, rep, &orig);
             noteRep(rep);
@@ -135,7 +138,7 @@ static void hookSessionClass(Class c) {
                 if (!orig) return nil;
                 TLOG(@"[req] uploadTask %@ %@ bodyBytes=%lu ua=%@ clientver=%@", req.HTTPMethod, safeURL(req.URL),
                      (unsigned long)body.length, headerOf(req, @"User-Agent", 60), headerOf(req, @"X-Twitter-Client-Version", 20));
-                return ((id (*)(id, SEL, id, id, id))orig)(_self, sel, req, body, wrapCompletion(@"uploadTask", req, h));
+                return ((id (*)(id, SEL, id, id, id))orig)(_self, sel, req, body, (h ? wrapCompletion(@"uploadTask", req, h) : nil));
             });
             MSHookMessageEx(c, sel, rep, &orig);
             noteRep(rep);
