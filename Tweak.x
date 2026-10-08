@@ -1,4 +1,4 @@
-// TwLog 0.7.0
+// TwLog 0.8.0
 // 0.5.1 fix: never add a completion handler to a task that did not have one. NSURLSession routes
 // handler-less tasks through the same methods with a nil handler; wrapping nil made the app's own
 // network layer lose its delegate callbacks (requests hung until they timed out).
@@ -21,6 +21,9 @@
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
+
+// 0 = observe only. (The welcome->login flow rewrite from 0.7.0 failed server-side, so it is off.)
+#define TWLOG_REWRITE_FLOW 0
 
 #define TLOG(fmt, ...) NSLog(@"[TwLog] " fmt, ##__VA_ARGS__)
 
@@ -46,6 +49,9 @@ static NSString *safeURL(NSURL *u) {
 // EXPERIMENT (0.7.0): the app asks Twitter for the "welcome" onboarding flow at launch and the server refuses it.
 // Ask for the "login" flow instead, to see whether the server answers it and what the app does with the answer.
 static NSURLRequest *rewriteFlow(NSURLRequest *req) {
+#if !TWLOG_REWRITE_FLOW
+    return req;
+#endif
     NSURL *u = req.URL;
     if (!u || ![u.path hasSuffix:@"/onboarding/task.json"]) return req;
     NSString *abs = u.absoluteString;
@@ -62,6 +68,13 @@ static NSString *headerOf(NSURLRequest *req, NSString *name, NSUInteger max) {
     NSString *v = [req valueForHTTPHeaderField:name];
     if (!v) return @"-";
     return v.length > max ? [v substringToIndex:max] : v;
+}
+
+static NSString *authSchemeOf(NSURLRequest *r) {
+    NSString *v = [r valueForHTTPHeaderField:@"Authorization"];
+    if (!v.length) return @"-";
+    NSRange sp = [v rangeOfString:@" "];
+    return sp.location == NSNotFound ? @"?" : [v substringToIndex:sp.location];
 }
 
 static long statusOf(NSURLResponse *r) {
@@ -499,6 +512,7 @@ static void hookTaskClass(Class c) {
                          (unsigned long)r.HTTPBody.length, (int)(r.HTTPBodyStream != nil),
                          headerOf(r, @"Content-Type", 40), headerOf(r, @"User-Agent", 60),
                          headerOf(r, @"X-Twitter-Client-Version", 20));
+                    TLOG(@"[task-auth] scheme=%@ for %@", authSchemeOf(r), safeURL(r.URL));
                 }
                 if (orig) ((void (*)(id, SEL))orig)(_self, sel);
             });
@@ -953,6 +967,58 @@ static void dumpSelectorsFiltered(NSString *className, NSArray *keys, int cap) {
     }
 }
 
+#pragma mark - NSURLConnection (older code paths), log-only
+
+static void logConnReq(NSString *tag, id req) {
+    NSURLRequest *r = [req isKindOfClass:[NSURLRequest class]] ? req : nil;
+    TLOG(@"[conn-req] %@ %@ %@ ua=%@ clientver=%@ auth=%@", tag, r.HTTPMethod ?: @"?", safeURL(r.URL),
+         headerOf(r, @"User-Agent", 60), headerOf(r, @"X-Twitter-Client-Version", 20), authSchemeOf(r));
+}
+
+static void hookConnDelegate(Class cls) {
+    static NSMutableSet *done;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ done = [NSMutableSet set]; });
+    @synchronized (done) {
+        if ([done containsObject:cls]) return;
+        [done addObject:cls];
+    }
+    hookEntry(cls, @"connection:didReceiveResponse:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t cc, uintptr_t d, uintptr_t e, uintptr_t f) {
+        id r = objAt(b);
+        long st = [r isKindOfClass:[NSHTTPURLResponse class]] ? (long)((NSHTTPURLResponse *)r).statusCode : -1L;
+        NSString *u = [r isKindOfClass:[NSURLResponse class]] ? safeURL(((NSURLResponse *)r).URL) : @"?";
+        TLOG(@"[conn-resp] status=%ld url=%@", st, u);
+    });
+    hookEntry(cls, @"connection:didFailWithError:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t cc, uintptr_t d, uintptr_t e, uintptr_t f) {
+        id err = objAt(b);
+        TLOG(@"[conn-fail] %@", [err isKindOfClass:[NSError class]] ? errStr(err) : @"?");
+    });
+}
+
+static void hookNSURLConnection(void) {
+    Class k = NSClassFromString(@"NSURLConnection");
+    if (!k) return;
+    hookEntry(k, @"initWithRequest:delegate:startImmediately:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t cc, uintptr_t d, uintptr_t e, uintptr_t f) {
+        logConnReq(@"init", objAt(a));
+        if (b) hookConnDelegate(object_getClass(objAt(b)));
+    });
+    hookEntry(k, @"initWithRequest:delegate:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t cc, uintptr_t d, uintptr_t e, uintptr_t f) {
+        logConnReq(@"init", objAt(a));
+        if (b) hookConnDelegate(object_getClass(objAt(b)));
+    });
+    Class meta = object_getClass(k);
+    hookEntry(meta, @"connectionWithRequest:delegate:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t cc, uintptr_t d, uintptr_t e, uintptr_t f) {
+        logConnReq(@"connectionWithRequest", objAt(a));
+        if (b) hookConnDelegate(object_getClass(objAt(b)));
+    });
+    hookEntry(meta, @"sendAsynchronousRequest:queue:completionHandler:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t cc, uintptr_t d, uintptr_t e, uintptr_t f) {
+        logConnReq(@"sendAsync", objAt(a));
+    });
+    hookEntry(meta, @"sendSynchronousRequest:returningResponse:error:", ^(id s, uintptr_t a, uintptr_t b, uintptr_t cc, uintptr_t d, uintptr_t e, uintptr_t f) {
+        logConnReq(@"sendSync", objAt(a));
+    });
+}
+
 #pragma mark - Init
 
 %ctor {
@@ -968,6 +1034,7 @@ static void dumpSelectorsFiltered(NSString *className, NSArray *keys, int cap) {
         hookTaskClasses();
         hookTNL();
         hookAuthAndTNL();
+        hookNSURLConnection();
         hookFeatureSwitchClasses();
 
         %init;
