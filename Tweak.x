@@ -1,4 +1,12 @@
-// TwLog 0.8.0
+// TwLog 0.9.0
+// 0.9.0: the app predates the 2023 twitter.com -> x.com rename, so its web view
+// delegate blocks navigations whose host is x.com (WebKitErrorDomain 102). That is
+// what turns the in-app password-reset page blank: it loads twitter.com/account/
+// begin_password_reset fine, then that page redirects to x.com/i/jf/web/password_reset,
+// and the app's own policy check cancels it before anything renders. The fix below
+// only overrides a decision the app was ABOUT to cancel, and only when the destination
+// host is x.com -- it does not touch twitter.com navigations, does not touch anything
+// server-side, and does not change what page loads, only whether the app lets it load.
 // 0.5.1 fix: never add a completion handler to a task that did not have one. NSURLSession routes
 // handler-less tasks through the same methods with a nil handler; wrapping nil made the app's own
 // network layer lose its delegate callbacks (requests hung until they timed out).
@@ -62,6 +70,13 @@ static NSURLRequest *rewriteFlow(NSURLRequest *req) {
     m.URL = nu;
     TLOG(@"[rewrite] onboarding flow_name welcome -> login");
     return m;
+}
+
+// True for x.com and any of its subdomains (api.x.com, www.x.com, ...), never for
+// twitter.com -- scoped narrowly so this only touches the one rename-related block.
+static BOOL isXComHost(NSURL *u) {
+    NSString *h = u.host.lowercaseString;
+    return h && ([h isEqualToString:@"x.com"] || [h hasSuffix:@".x.com"]);
 }
 
 static NSString *headerOf(NSURLRequest *req, NSString *name, NSUInteger max) {
@@ -373,8 +388,14 @@ static void hookNavDelegateClass(Class c) {
             IMP rep = imp_implementationWithBlock(^(id _self, WKWebView *wv, WKNavigationAction *a, void (^handler)(NSInteger)) {
                 NSString *u = safeURL(a.request.URL);
                 TLOG(@"[web] action url=%@ type=%ld mainFrame=%d", u, (long)a.navigationType, (int)a.targetFrame.mainFrame);
+                BOOL xHost = isXComHost(a.request.URL);
                 void (^w)(NSInteger) = ^(NSInteger p) {
-                    TLOG(@"[web] action policy=%ld (0=cancel,1=allow) for %@", (long)p, u);
+                    if (p == 0 && xHost) {
+                        TLOG(@"[web] action OVERRIDE 0->1 (app would block x.com host) for %@", u);
+                        p = 1;
+                    } else {
+                        TLOG(@"[web] action policy=%ld (0=cancel,1=allow) for %@", (long)p, u);
+                    }
                     if (handler) handler(p);
                 };
                 if (orig) ((void (*)(id, SEL, id, id, id))orig)(_self, sel, wv, a, w);
@@ -392,8 +413,14 @@ static void hookNavDelegateClass(Class c) {
                 NSString *u = safeURL(r.response.URL);
                 TLOG(@"[web] response status=%ld url=%@ mainFrame=%d mime=%@", statusOf(r.response), u,
                      (int)r.forMainFrame, r.response.MIMEType);
+                BOOL xHost = isXComHost(r.response.URL);
                 void (^w)(NSInteger) = ^(NSInteger p) {
-                    TLOG(@"[web] response policy=%ld (0=cancel,1=allow) for %@", (long)p, u);
+                    if (p == 0 && xHost) {
+                        TLOG(@"[web] response OVERRIDE 0->1 (app would block x.com host) for %@", u);
+                        p = 1;
+                    } else {
+                        TLOG(@"[web] response policy=%ld (0=cancel,1=allow) for %@", (long)p, u);
+                    }
                     if (handler) handler(p);
                 };
                 if (orig) ((void (*)(id, SEL, id, id, id))orig)(_self, sel, wv, r, w);
