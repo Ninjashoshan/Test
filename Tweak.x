@@ -1,4 +1,4 @@
-// TwLog 0.6.0
+// TwLog 0.7.0
 // 0.5.1 fix: never add a completion handler to a task that did not have one. NSURLSession routes
 // handler-less tasks through the same methods with a nil handler; wrapping nil made the app's own
 // network layer lose its delegate callbacks (requests hung until they timed out).
@@ -41,6 +41,21 @@ static NSString *safeURL(NSURL *u) {
     NSString *base = [NSString stringWithFormat:@"%@://%@%@", c.scheme ?: @"?", c.host ?: @"", c.path ?: @""];
     if (names.count) return [base stringByAppendingFormat:@" ?[%@]", [names componentsJoinedByString:@","]];
     return base;
+}
+
+// EXPERIMENT (0.7.0): the app asks Twitter for the "welcome" onboarding flow at launch and the server refuses it.
+// Ask for the "login" flow instead, to see whether the server answers it and what the app does with the answer.
+static NSURLRequest *rewriteFlow(NSURLRequest *req) {
+    NSURL *u = req.URL;
+    if (!u || ![u.path hasSuffix:@"/onboarding/task.json"]) return req;
+    NSString *abs = u.absoluteString;
+    if ([abs rangeOfString:@"flow_name=welcome"].location == NSNotFound) return req;
+    NSURL *nu = [NSURL URLWithString:[abs stringByReplacingOccurrencesOfString:@"flow_name=welcome" withString:@"flow_name=login"]];
+    if (!nu) return req;
+    NSMutableURLRequest *m = [req mutableCopy];
+    m.URL = nu;
+    TLOG(@"[rewrite] onboarding flow_name welcome -> login");
+    return m;
 }
 
 static NSString *headerOf(NSURLRequest *req, NSString *name, NSUInteger max) {
@@ -140,9 +155,38 @@ static void hookSessionClass(Class c) {
             __block IMP orig = NULL;
             IMP rep = imp_implementationWithBlock(^id(id _self, NSURLRequest *req, NSData *body, TLCompletion h) {
                 if (!orig) return nil;
+                req = rewriteFlow(req);
                 TLOG(@"[req] uploadTask %@ %@ bodyBytes=%lu ua=%@ clientver=%@", req.HTTPMethod, safeURL(req.URL),
                      (unsigned long)body.length, headerOf(req, @"User-Agent", 60), headerOf(req, @"X-Twitter-Client-Version", 20));
                 return ((id (*)(id, SEL, id, id, id))orig)(_self, sel, req, body, (h ? wrapCompletion(@"uploadTask", req, h) : nil));
+            });
+            MSHookMessageEx(c, sel, rep, &orig);
+            noteRep(rep);
+        }
+    }
+    {
+        SEL sel = @selector(uploadTaskWithRequest:fromData:);
+        if (canHook(c, sel)) {
+            __block IMP orig = NULL;
+            IMP rep = imp_implementationWithBlock(^id(id _self, NSURLRequest *req, NSData *body) {
+                if (!orig) return nil;
+                req = rewriteFlow(req);
+                TLOG(@"[req] uploadTask(nohandler) %@ %@ bodyBytes=%lu ua=%@ clientver=%@", req.HTTPMethod, safeURL(req.URL),
+                     (unsigned long)body.length, headerOf(req, @"User-Agent", 60), headerOf(req, @"X-Twitter-Client-Version", 20));
+                return ((id (*)(id, SEL, id, id))orig)(_self, sel, req, body);
+            });
+            MSHookMessageEx(c, sel, rep, &orig);
+            noteRep(rep);
+        }
+    }
+    {
+        SEL sel = @selector(dataTaskWithRequest:);
+        if (canHook(c, sel)) {
+            __block IMP orig = NULL;
+            IMP rep = imp_implementationWithBlock(^id(id _self, NSURLRequest *req) {
+                if (!orig) return nil;
+                req = rewriteFlow(req);
+                return ((id (*)(id, SEL, id))orig)(_self, sel, req);
             });
             MSHookMessageEx(c, sel, rep, &orig);
             noteRep(rep);
@@ -201,9 +245,17 @@ static void hookDelegateClass(Class c) {
             __block IMP orig = NULL;
             IMP rep = imp_implementationWithBlock(^(id _self, NSURLSession *s, NSURLSessionDataTask *t, NSData *d) {
                 long st = statusOf(t.response);
+                NSURLRequest *r = t.currentRequest ?: t.originalRequest;
                 if (st >= 400) {
-                    NSURLRequest *r = t.currentRequest ?: t.originalRequest;
                     TLOG(@"[resp-body] status=%ld %@ %@", st, safeURL(r.URL), bodyPreview(d, 300));
+                } else if ([r.URL.path containsString:@"/onboarding/"]) {
+                    NSString *txt = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                    NSMutableArray *ids = [NSMutableArray array];
+                    NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\"subtask_id\"\\s*:\\s*\"([^\"]+)\"" options:0 error:nil];
+                    for (NSTextCheckingResult *m in [rx matchesInString:txt ?: @"" options:0 range:NSMakeRange(0, txt.length)]) {
+                        if (ids.count < 8) [ids addObject:[txt substringWithRange:[m rangeAtIndex:1]]];
+                    }
+                    TLOG(@"[onboarding] status=%ld bytes=%lu subtasks=[%@]", st, (unsigned long)d.length, [ids componentsJoinedByString:@","]);
                 }
                 if (orig) ((void (*)(id, SEL, id, id, id))orig)(_self, sel, s, t, d);
             });
@@ -770,7 +822,7 @@ static void hookAuthAndTNL(void) {
 
 static BOOL fsKeyInteresting(NSString *k) {
     NSString *lo = k.lowercaseString;
-    for (NSString *w in @[@"sign", @"login", @"log_in", @"onboard", @"flow", @"adaptive", @"xauth", @"welcome", @"signup", @"auth", @"wizard", @"password"]) {
+    for (NSString *w in @[@"sign", @"login", @"log_in", @"onboard", @"flow", @"adaptive", @"xauth", @"welcome", @"signup", @"auth", @"wizard"]) {
         if ([lo containsString:w]) return YES;
     }
     return NO;
@@ -834,7 +886,12 @@ static BOOL hookFeatureMethod(Class c, Method m) {
                     else res = ro ? NSStringFromClass([ro class]) : @"nil";
                     if (res.length > 60) res = [res substringToIndex:60];
                 } else res = [NSString stringWithFormat:@"%ld", (long)r];
-                TLOG(@"[fs] -[%@ %@] (%@) -> %@", tag, name, [strs componentsJoinedByString:@" | "], res);
+                static NSMutableSet *seenFS; static dispatch_once_t onceFS;
+                dispatch_once(&onceFS, ^{ seenFS = [NSMutableSet set]; });
+                NSString *fk = [NSString stringWithFormat:@"%@|%@|%@", tag, name, [strs componentsJoinedByString:@"|"]];
+                BOOL isNew;
+                @synchronized (seenFS) { isNew = ![seenFS containsObject:fk]; if (isNew) [seenFS addObject:fk]; }
+                if (isNew) TLOG(@"[fs] -[%@ %@] (%@) -> %@", tag, name, [strs componentsJoinedByString:@" | "], res);
             }
         } @catch (NSException *ex) {}
         return r;
@@ -914,15 +971,5 @@ static void dumpSelectorsFiltered(NSString *className, NSArray *keys, int cap) {
         hookFeatureSwitchClasses();
 
         %init;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            NSArray *loginKeys = @[@"log", @"sign", @"flow", @"onboard", @"welcome", @"adaptive", @"present", @"submit", @"auth"];
-            dumpSelectorsFiltered(@"T1CombinedSignUpWelcomeViewController", loginKeys, 80);
-            dumpSelectorsFiltered(@"T1HostViewController", loginKeys, 80);
-            dumpSelectorsFiltered(@"T1SignInViewController", loginKeys, 60);
-            dumpSelectorsFiltered(@"T1AdaptiveSignInFlow", nil, 60);
-            dumpSelectorsFiltered(@"T1OnboardingPresenter", nil, 60);
-            dumpSelectorsFiltered(@"TFSTwitterOnboardingFlowSpec", nil, 60);
-            dumpSelectorsFiltered(@"T1OnboardingFlowController", nil, 90);
-        });
     }
 }
