@@ -1,9 +1,0 @@
-Package: com.twlog.twitterlogger
-Name: TwLog
-Version: 0.1.0
-Architecture: iphoneos-arm
-Description: Logs the Twitter app's network and web view activity to the system log
-Maintainer: me
-Author: me
-Section: Tweaks
-Depends: mobilesubstrate
