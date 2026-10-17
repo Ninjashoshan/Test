@@ -5,10 +5,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: beerpiss/theos-action@v1   # installs Theos + toolchain + SDKs
+      - uses: Randomblock1/theos-action@main
       - name: Build
         run: |
-          export THEOS=${{ github.workspace }}/theos
           make package FINALPACKAGE=1
       - uses: actions/upload-artifact@v4
         with:
