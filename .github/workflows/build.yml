@@ -1,47 +1,17 @@
 name: Build tweak
-
-# Builds the GSALogger .deb on GitHub's runners (no Mac/Linux of your own
-# needed). After a run finishes, download the package from the run's
-# "Artifacts" section.
-
-on:
-  push:
-  workflow_dispatch:   # lets you trigger a build by hand from the Actions tab
+on: [push, workflow_dispatch]
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    container: ghcr.io/l1ghtmann/theos:latest   # Theos + toolchain + SDKs preinstalled
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential fakeroot zip git perl curl
-
-      - name: Install Theos + toolchain + iOS 10.3 SDK
-        run: |
-          export THEOS=$HOME/theos
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-          git clone --recursive https://github.com/theos/theos.git "$THEOS"
-
-          # Swift/Linux toolchain that can emit iOS arm64 binaries
-          curl -fL https://github.com/theos/toolchain/releases/latest/download/swift-toolchain-linux.tar.lzma -o /tmp/tc.tar.lzma
-          mkdir -p "$THEOS/toolchain/linux"
-          tar --lzma -xf /tmp/tc.tar.lzma -C "$THEOS/toolchain/linux"
-
-          # iOS 10.3 SDK so the tweak can target 10.3.3
-          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
-          mv /tmp/sdks/iPhoneOS10.3.sdk "$THEOS/sdks/"
-
+      - uses: actions/checkout@v4
       - name: Build package
         run: |
-          export THEOS=$HOME/theos
+          export THEOS=/theos
           make package FINALPACKAGE=1
-
-      - name: Upload .deb
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: gsa-logger-deb
           path: packages/*.deb
