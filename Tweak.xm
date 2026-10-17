@@ -121,7 +121,10 @@ static const BOOL kGSAForceS2KFO = NO;
 // SRP proof is computed over the wrong username and the server rejects it
 // ("M2 missing" / -36607 / -22406). We rewrite the OUTGOING request body so
 // `u` carries the DSID, matching what the account's verifier expects.
-static const BOOL kGSAFixUsername = YES;
+// Body-level username rewrite. OFF now — it patches `u` AFTER M1 is built over
+// the email, so the server sees a DSID that doesn't match the proof. Superseded
+// by altDSID injection below, which fixes the identity BEFORE the proof.
+static const BOOL kGSAFixUsername = NO;
 
 // The email akd currently sends, and the DSID it should send instead.
 // (DSID captured from the working 12.5 login for this same account.)
@@ -142,6 +145,47 @@ static BOOL GSARewriteUsername(NSMutableDictionary *root) {
         }
     }
     return NO;
+}
+
+// ---- altDSID injection -----------------------------------------------------
+//
+// ROOT CAUSE (from comparing a working iOS 12.5 login to this failing 10.3.3):
+// the working device has the account altDSID on its auth context, so akd uses
+// the DSID as the SRP username and computes M1 over it. This restored 10.3.3
+// device has "No altDSID on context", so akd falls back to the email, computes
+// M1 over the email, and the server rejects it. Rewriting the outgoing `u`
+// field is too late (M1 is already built over the email). The real fix is to
+// supply the altDSID BEFORE the proof is built, by making akd's altDSID
+// accessors return the DSID. akd then does the whole SRP exchange over the
+// DSID natively, exactly as it did before the restore.
+
+static const BOOL kGSAInjectAltDSID = YES;
+
+// We swizzle any zero-argument accessor named like an altDSID getter on the
+// AuthKit account/context classes to return this. Selector names vary across
+// builds, so we try a list and log which ones exist.
+static NSString *GSAAltDSIDValue(void) { return kGSADSID; }
+
+// Install an altDSID override on `cls`'s instance method `name`, if it exists.
+// Calls through to the original and ONLY substitutes the DSID when the real
+// value is nil/empty — i.e. exactly the "No altDSID on context" case. This
+// avoids disturbing any flow that already has a correct altDSID.
+static void GSAHookAltDSID(Class cls, NSString *clsName, NSString *name) {
+    if (!cls) return;
+    SEL sel = NSSelectorFromString(name);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    __block IMP orig = method_setImplementation(m,
+        imp_implementationWithBlock(^id(id self_) {
+            id real = ((id(*)(id,SEL))orig)(self_, sel);
+            if ([real isKindOfClass:[NSString class]] &&
+                [(NSString *)real length] > 0) {
+                return real; // already has one — leave it
+            }
+            GSALog(@"supplying DSID via -[%@ %@] (was empty)", clsName, name);
+            return GSAAltDSIDValue();
+        }));
+    GSALog(@"hooked -[%@ %@] (altDSID)", clsName, name);
 }
 
 // Walk the parsed response, find Response.sp (== "s2k"), rewrite to "s2k_fo".
@@ -308,6 +352,28 @@ static BOOL GSARewriteSP(NSMutableDictionary *root) {
                 GSALog(@"hooked -[NSMutableURLRequest setHTTPBody:] (fix username = %@)",
                        kGSAFixUsername ? @"ON" : @"off");
             }
+        }
+
+        // 5: THE FIX — inject the altDSID so akd builds the SRP identity over
+        // the DSID (like the working device), instead of falling back to the
+        // email after the clean restore wiped the altDSID from its context.
+        if (kGSAInjectAltDSID) {
+            // Candidate AuthKit classes that carry the account / auth context.
+            NSArray *clsNames = @[ @"AKAccount", @"ACAccount",
+                                   @"AKAppleIDAuthenticationContext",
+                                   @"AKAnisetteData",
+                                   @"AKAppleIDAuthenticationController",
+                                   @"AKAppleIDAuthenticationService" ];
+            // Zero-arg accessors that may return the altDSID.
+            NSArray *selNames = @[ @"altDSID", @"aa_altDSID", @"_altDSID",
+                                   @"altDSIDForAuthentication", @"DSID" ];
+            for (NSString *cn in clsNames) {
+                Class c = objc_getClass([cn UTF8String]);
+                for (NSString *sn in selNames) {
+                    GSAHookAltDSID(c, cn, sn);
+                }
+            }
+            GSALog(@"altDSID injection pass done (value=%@)", kGSADSID);
         }
     }
 }
