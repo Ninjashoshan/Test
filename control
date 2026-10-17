@@ -1,0 +1,9 @@
+Package: com.yourname.gsalogger
+Name: GSALogger
+Version: 0.1
+Architecture: iphoneos-arm
+Description: Logs akd GrandSlam SRP request/response plists to /tmp/gsa_debug.log for diagnosing Apple ID M2/-36607 sign-in failures.
+Maintainer: you
+Author: you
+Section: Tweaks
+Depends: mobilesubstrate
