@@ -15,8 +15,25 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
-static NSString * const kLogPath = @"/tmp/gsa_debug.log";
 static NSObject *gLogLock;
+static NSString *gLogPath;   // chosen at load time from candidates below
+
+// akd runs in a tight sandbox; /tmp is often not writable. Pick the first
+// path we can actually create a file in. Whatever we pick is printed to
+// syslog at load so you know where to look.
+static NSString *GSAChooseLogPath(void) {
+    NSArray *candidates = @[
+        @"/var/mobile/gsa_debug.log",
+        @"/var/root/gsa_debug.log",
+        @"/var/tmp/gsa_debug.log",
+        @"/tmp/gsa_debug.log",
+    ];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *p in candidates) {
+        if ([fm createFileAtPath:p contents:nil attributes:nil]) return p;
+    }
+    return nil; // nothing writable — we'll rely on syslog only
+}
 
 // ---- logging helpers -------------------------------------------------------
 
@@ -31,17 +48,24 @@ static void GSALog(NSString *fmt, ...) {
     NSString *line = [NSString stringWithFormat:@"%@  %@\n",
                       [df stringFromDate:[NSDate date]], msg];
 
+    // Always mirror to syslog, prefixed so you can grep "GSALOG" out of the
+    // normal device log even if no file path is writable.
+    NSLog(@"GSALOG %@", msg);
+
     @synchronized (gLogLock) {
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
+        if (!gLogPath) return; // syslog-only mode
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
         if (!fh) {
-            [[NSFileManager defaultManager] createFileAtPath:kLogPath
+            [[NSFileManager defaultManager] createFileAtPath:gLogPath
                                                     contents:nil
                                                   attributes:nil];
-            fh = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
+            fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
         }
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
     }
 }
 
@@ -97,13 +121,14 @@ static id GSAPlistFromData(NSData *data) {
 %ctor {
     @autoreleasepool {
         gLogLock = [[NSObject alloc] init];
-        GSALog(@"==== GSALogger loaded in pid %d (%@) ====",
-               getpid(),
-               [[NSProcessInfo processInfo] processName]);
 
         // Only do real work inside akd.
         NSString *proc = [[NSProcessInfo processInfo] processName];
         if (![proc isEqualToString:@"akd"]) return;
+
+        gLogPath = GSAChooseLogPath();
+        GSALog(@"==== GSALogger loaded in pid %d (%@); logfile=%@ ====",
+               getpid(), proc, gLogPath ?: @"(none - syslog only)");
 
         // 1 & 2: AIASRequest / AIASSession request+response accessors.
         // Swizzle -[AIASSession URLSession:dataTask:didReceiveData:] to capture
