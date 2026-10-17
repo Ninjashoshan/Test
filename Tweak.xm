@@ -94,8 +94,6 @@ static id GSAPlistFromData(NSData *data) {
 //   2. the response dictionary just after it's parsed
 //   3. the raw bytes handed to didReceiveData: (fallback if 1/2 are opaque)
 
-%hookf(void, "noop") { } // keeps Logos happy if no static %hook is emitted
-
 %ctor {
     @autoreleasepool {
         gLogLock = [[NSObject alloc] init];
