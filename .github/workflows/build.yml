@@ -1,15 +1,14 @@
 name: Build tweak
 on: [push, workflow_dispatch]
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ghcr.io/l1ghtmann/theos:latest   # Theos + toolchain + SDKs preinstalled
     steps:
       - uses: actions/checkout@v4
-      - name: Build package
+      - uses: beerpiss/theos-action@v1   # installs Theos + toolchain + SDKs
+      - name: Build
         run: |
-          export THEOS=/theos
+          export THEOS=${{ github.workspace }}/theos
           make package FINALPACKAGE=1
       - uses: actions/upload-artifact@v4
         with:
