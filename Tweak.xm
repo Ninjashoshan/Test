@@ -98,15 +98,43 @@ static NSString *GSADescribe(id obj) {
 }
 
 // Try to turn a raw HTTP body into a plist dict. GSA bodies are XML or binary
-// plists; NSPropertyListSerialization reads both.
-static id GSAPlistFromData(NSData *data) {
+// plists; NSPropertyListSerialization reads both. We ask for a MUTABLE container
+// so we can rewrite sp in place when patching is on.
+static id GSAPlistFromData(NSData *data, NSPropertyListFormat *outFmt) {
     if (![data isKindOfClass:[NSData class]] || [data length] == 0) return nil;
     NSError *err = nil;
-    id obj = [NSPropertyListSerialization propertyListWithData:data
-                                                       options:NSPropertyListImmutable
-                                                        format:NULL
-                                                         error:&err];
+    id obj = [NSPropertyListSerialization
+                 propertyListWithData:data
+                              options:NSPropertyListMutableContainersAndLeaves
+                               format:outFmt
+                                error:&err];
     return obj; // nil if not a plist (e.g. still encrypted) — caller handles
+}
+
+// Master switch for the experiment. When YES, any server-selected sp == "s2k"
+// is rewritten to "s2k_fo" before akd reads it, forcing the hex-encoded PBKDF2
+// derivation. Flip to NO to go back to pure logging.
+static const BOOL kGSAForceS2KFO = YES;
+
+// Walk the parsed response, find Response.sp (== "s2k"), rewrite to "s2k_fo".
+// Returns YES if it changed something. Mutates the dict in place.
+static BOOL GSARewriteSP(NSMutableDictionary *root) {
+    if (![root isKindOfClass:[NSDictionary class]]) return NO;
+    id resp = root[@"Response"];
+    if ([resp isKindOfClass:[NSDictionary class]]) {
+        id sp = ((NSDictionary *)resp)[@"sp"];
+        if ([sp isKindOfClass:[NSString class]] && [sp isEqualToString:@"s2k"]) {
+            ((NSMutableDictionary *)resp)[@"sp"] = @"s2k_fo";
+            return YES;
+        }
+    }
+    // Some builds place sp at the top level instead of under Response.
+    id spTop = root[@"sp"];
+    if ([spTop isKindOfClass:[NSString class]] && [spTop isEqualToString:@"s2k"]) {
+        root[@"sp"] = @"s2k_fo";
+        return YES;
+    }
+    return NO;
 }
 
 // ---- hooks -----------------------------------------------------------------
@@ -140,18 +168,42 @@ static id GSAPlistFromData(NSData *data) {
             if (m) {
                 __block IMP orig = method_setImplementation(m,
                     imp_implementationWithBlock(^(id self_, id session, id task, NSData *data) {
-                        id plist = GSAPlistFromData(data);
+                        NSData *outData = data; // what we actually pass to akd
+                        NSPropertyListFormat fmt = NSPropertyListXMLFormat_v1_0;
+                        id plist = GSAPlistFromData(data, &fmt);
                         if (plist) {
                             GSALog(@"--- RESPONSE (%lu bytes, parsed) ---\n%@",
                                    (unsigned long)[data length], GSADescribe(plist));
+
+                            if (kGSAForceS2KFO &&
+                                [plist isKindOfClass:[NSDictionary class]]) {
+                                if (GSARewriteSP((NSMutableDictionary *)plist)) {
+                                    NSError *serr = nil;
+                                    NSData *patched = [NSPropertyListSerialization
+                                        dataWithPropertyList:plist
+                                                      format:fmt
+                                                     options:0
+                                                       error:&serr];
+                                    if (patched) {
+                                        outData = patched;
+                                        GSALog(@"*** PATCHED sp s2k -> s2k_fo (new %lu bytes) ***\n%@",
+                                               (unsigned long)[patched length],
+                                               GSADescribe(plist));
+                                    } else {
+                                        GSALog(@"*** PATCH FAILED to re-serialize: %@ ***",
+                                               serr);
+                                    }
+                                }
+                            }
                         } else {
                             GSALog(@"--- RESPONSE (%lu bytes, opaque/not-plist) ---\n%@",
                                    (unsigned long)[data length],
                                    [data description]); // hex-ish dump from NSData
                         }
-                        ((void(*)(id,SEL,id,id,NSData*))orig)(self_, sel, session, task, data);
+                        ((void(*)(id,SEL,id,id,NSData*))orig)(self_, sel, session, task, outData);
                     }));
-                GSALog(@"hooked -[AIASSession URLSession:dataTask:didReceiveData:]");
+                GSALog(@"hooked -[AIASSession URLSession:dataTask:didReceiveData:] (force s2k_fo = %@)",
+                       kGSAForceS2KFO ? @"ON" : @"off");
             } else {
                 GSALog(@"WARN: AIASSession has no didReceiveData: on this build");
             }
