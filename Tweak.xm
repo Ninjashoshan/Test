@@ -111,10 +111,38 @@ static id GSAPlistFromData(NSData *data, NSPropertyListFormat *outFmt) {
     return obj; // nil if not a plist (e.g. still encrypted) — caller handles
 }
 
-// Master switch for the experiment. When YES, any server-selected sp == "s2k"
-// is rewritten to "s2k_fo" before akd reads it, forcing the hex-encoded PBKDF2
-// derivation. Flip to NO to go back to pure logging.
-static const BOOL kGSAForceS2KFO = NO;   // OFF: capture the natural exchange
+// Master switch for the old experiment (sp rewrite). Abandoned — the working
+// 12.5 device also uses sp=s2k, so this was never the issue. Kept OFF.
+static const BOOL kGSAForceS2KFO = NO;
+
+// THE REAL FIX.
+// A working device (iOS 12.5) sends the account DSID as the SRP username `u`;
+// this freshly-restored 10.3.3 device sends the email address instead, so the
+// SRP proof is computed over the wrong username and the server rejects it
+// ("M2 missing" / -36607 / -22406). We rewrite the OUTGOING request body so
+// `u` carries the DSID, matching what the account's verifier expects.
+static const BOOL kGSAFixUsername = YES;
+
+// The email akd currently sends, and the DSID it should send instead.
+// (DSID captured from the working 12.5 login for this same account.)
+static NSString * const kGSAEmail = @"aq_artix2@yahoo.com";
+static NSString * const kGSADSID  = @"000025-08-7ce934f8-83af-4aee-b25f-243520e5c2c8";
+
+// In an outgoing GSA request, replace Request.u (== the email) with the DSID.
+// Returns YES if it changed something. Mutates the dict in place.
+static BOOL GSARewriteUsername(NSMutableDictionary *root) {
+    if (![root isKindOfClass:[NSDictionary class]]) return NO;
+    id req = root[@"Request"];
+    if ([req isKindOfClass:[NSDictionary class]]) {
+        id u = ((NSDictionary *)req)[@"u"];
+        if ([u isKindOfClass:[NSString class]] &&
+            [u caseInsensitiveCompare:kGSAEmail] == NSOrderedSame) {
+            ((NSMutableDictionary *)req)[@"u"] = kGSADSID;
+            return YES;
+        }
+    }
+    return NO;
+}
 
 // Walk the parsed response, find Response.sp (== "s2k"), rewrite to "s2k_fo".
 // Returns YES if it changed something. Mutates the dict in place.
@@ -246,16 +274,39 @@ static BOOL GSARewriteSP(NSMutableDictionary *root) {
             if (m) {
                 __block IMP orig = method_setImplementation(m,
                     imp_implementationWithBlock(^(id self_, NSData *body) {
+                        NSData *outBody = body;
                         NSPropertyListFormat fmt = NSPropertyListXMLFormat_v1_0;
                         id plist = GSAPlistFromData(body, &fmt);
                         if (plist) {
                             GSALog(@"--- HTTPBody REQUEST (%lu bytes) ---\n%@",
                                    (unsigned long)[body length], GSADescribe(plist));
+
+                            if (kGSAFixUsername &&
+                                [plist isKindOfClass:[NSDictionary class]]) {
+                                if (GSARewriteUsername((NSMutableDictionary *)plist)) {
+                                    NSError *serr = nil;
+                                    NSData *patched = [NSPropertyListSerialization
+                                        dataWithPropertyList:plist
+                                                      format:fmt
+                                                     options:0
+                                                       error:&serr];
+                                    if (patched) {
+                                        outBody = patched;
+                                        GSALog(@"*** PATCHED u email -> DSID (new %lu bytes) ***\n%@",
+                                               (unsigned long)[patched length],
+                                               GSADescribe(plist));
+                                    } else {
+                                        GSALog(@"*** USERNAME PATCH re-serialize FAILED: %@ ***",
+                                               serr);
+                                    }
+                                }
+                            }
                         }
                         // else: not a plist (token refresh, etc.) — skip quietly
-                        ((void(*)(id,SEL,NSData*))orig)(self_, sel, body);
+                        ((void(*)(id,SEL,NSData*))orig)(self_, sel, outBody);
                     }));
-                GSALog(@"hooked -[NSMutableURLRequest setHTTPBody:]");
+                GSALog(@"hooked -[NSMutableURLRequest setHTTPBody:] (fix username = %@)",
+                       kGSAFixUsername ? @"ON" : @"off");
             }
         }
     }
