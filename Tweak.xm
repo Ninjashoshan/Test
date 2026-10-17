@@ -14,6 +14,7 @@
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 static NSObject *gLogLock;
 static NSString *gLogPath;   // chosen at load time from candidates below
@@ -161,10 +162,48 @@ static BOOL GSARewriteUsername(NSMutableDictionary *root) {
 
 static const BOOL kGSAInjectAltDSID = YES;
 
-// We swizzle any zero-argument accessor named like an altDSID getter on the
-// AuthKit account/context classes to return this. Selector names vary across
-// builds, so we try a list and log which ones exist.
-static NSString *GSAAltDSIDValue(void) { return kGSADSID; }
+// ACCOUNT-SCOPED. We ONLY inject the DSID for the yahoo account, so that
+// signing OTHER accounts into iTunes is completely unaffected — akd behaves
+// natively for them. The map below is email -> DSID; add a line here if another
+// account ever needs the same treatment (capture its DSID from a working
+// login first).
+static NSDictionary *GSADSIDMap(void) {
+    return @{
+        @"aq_artix2@yahoo.com" : @"000025-08-7ce934f8-83af-4aee-b25f-243520e5c2c8",
+    };
+}
+
+// Ask an auth-context / account object for the username it is authenticating.
+// Tries the usual AuthKit accessors; returns nil if none respond.
+static NSString *GSAContextUsername(id ctx) {
+    for (NSString *sn in @[@"username", @"appleID", @"identifier"]) {
+        SEL s = NSSelectorFromString(sn);
+        if ([ctx respondsToSelector:s]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id v = [ctx performSelector:s];
+#pragma clang diagnostic pop
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
+                return (NSString *)v;
+            }
+        }
+    }
+    return nil;
+}
+
+// The DSID to inject for THIS context, or nil to leave akd alone. Looks up the
+// context's username in the map; only a mapped account gets a DSID.
+static NSString *GSAAltDSIDForContext(id ctx) {
+    NSString *user = GSAContextUsername(ctx);
+    if (!user) return nil;
+    NSDictionary *map = GSADSIDMap();
+    for (NSString *email in map) {
+        if ([user caseInsensitiveCompare:email] == NSOrderedSame) {
+            return map[email];
+        }
+    }
+    return nil; // not a mapped account — do nothing, sign in normally
+}
 
 // Install an altDSID override on `cls`'s instance method `name`, if it exists.
 // Calls through to the original and ONLY substitutes the DSID when the real
@@ -178,14 +217,34 @@ static void GSAHookAltDSID(Class cls, NSString *clsName, NSString *name) {
     __block IMP orig = method_setImplementation(m,
         imp_implementationWithBlock(^id(id self_) {
             id real = ((id(*)(id,SEL))orig)(self_, sel);
-            if ([real isKindOfClass:[NSString class]] &&
-                [(NSString *)real length] > 0) {
+            BOOL realPopulated = ([real isKindOfClass:[NSString class]] &&
+                                  [(NSString *)real length] > 0);
+            // SELF-HEAL PROBE: report what akd's own altDSID store returned,
+            // for the account being authenticated, before we decide to inject.
+            // If this says SELF-HEALED on a later launch, akd persisted the
+            // altDSID and the tweak can be removed. If it says EMPTY, the tweak
+            // is still doing the work and must stay.
+            {
+                NSString *who = GSAContextUsername(self_) ?: @"(unknown)";
+                GSALog(@"altDSID probe: account=%@ real=%@ via -[%@ %@]",
+                       who,
+                       realPopulated ? @"SELF-HEALED(populated)" : @"EMPTY(needs tweak)",
+                       clsName, name);
+            }
+            if (realPopulated) {
                 return real; // already has one — leave it
             }
-            GSALog(@"supplying DSID via -[%@ %@] (was empty)", clsName, name);
-            return GSAAltDSIDValue();
+            // Empty altDSID. Only inject for a MAPPED account (yahoo). For any
+            // other account we return the real (empty) value so akd signs it
+            // in normally — this is what keeps other iTunes logins working.
+            NSString *dsid = GSAAltDSIDForContext(self_);
+            if (dsid) {
+                GSALog(@"supplying DSID via -[%@ %@] for mapped account", clsName, name);
+                return dsid;
+            }
+            return real; // not our account — stay out of the way
         }));
-    GSALog(@"hooked -[%@ %@] (altDSID)", clsName, name);
+    GSALog(@"hooked -[%@ %@] (altDSID, account-scoped)", clsName, name);
 }
 
 // Walk the parsed response, find Response.sp (== "s2k"), rewrite to "s2k_fo".
