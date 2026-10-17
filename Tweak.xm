@@ -246,7 +246,7 @@ static BOOL GSARewriteSP(NSMutableDictionary *root) {
             if (m) {
                 __block IMP orig = method_setImplementation(m,
                     imp_implementationWithBlock(^(id self_, NSData *body) {
-                        NSPropertyListFormat fmt = 0;
+                        NSPropertyListFormat fmt = NSPropertyListXMLFormat_v1_0;
                         id plist = GSAPlistFromData(body, &fmt);
                         if (plist) {
                             GSALog(@"--- HTTPBody REQUEST (%lu bytes) ---\n%@",
