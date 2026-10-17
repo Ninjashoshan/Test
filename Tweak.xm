@@ -232,5 +232,31 @@ static BOOL GSARewriteSP(NSMutableDictionary *root) {
         } else {
             GSALog(@"WARN: AIASRequest class not found");
         }
+
+        // 4: the reliable one — hook -[NSMutableURLRequest setHTTPBody:].
+        // Every GSA request body passes through here as a plist, so this
+        // captures the client's A and M1 (the proof) regardless of what AIAS's
+        // internal selectors are named. This is Experiment A: compare M1 across
+        // a patched vs unpatched run — if M1 is identical, akd reused the s2k
+        // key and never re-derived under s2k_fo.
+        Class reqURLCls = objc_getClass("NSMutableURLRequest");
+        if (reqURLCls) {
+            SEL sel = @selector(setHTTPBody:);
+            Method m = class_getInstanceMethod(reqURLCls, sel);
+            if (m) {
+                __block IMP orig = method_setImplementation(m,
+                    imp_implementationWithBlock(^(id self_, NSData *body) {
+                        NSPropertyListFormat fmt = 0;
+                        id plist = GSAPlistFromData(body, &fmt);
+                        if (plist) {
+                            GSALog(@"--- HTTPBody REQUEST (%lu bytes) ---\n%@",
+                                   (unsigned long)[body length], GSADescribe(plist));
+                        }
+                        // else: not a plist (token refresh, etc.) — skip quietly
+                        ((void(*)(id,SEL,NSData*))orig)(self_, sel, body);
+                    }));
+                GSALog(@"hooked -[NSMutableURLRequest setHTTPBody:]");
+            }
+        }
     }
 }
